@@ -1,0 +1,17 @@
+
+Meet AI.xcodeproj/xcuserdata
+xcuserdata
+DerivedData/
+*.moved-aside
+*.xcuserstate
+
+Secrets.plist
+
+build/
+*.build
+*.framework
+*.app
+*.dSYM
+
+.DS_Store
+
