@@ -7,19 +7,34 @@ import AVFoundation
 // MARK: - Main view for the application
 
 struct ContentView: View {
+    enum AssistantMode: String, CaseIterable, Identifiable {
+        case chat = "Chat"
+        case agent = "Agent"
+
+        var id: String { rawValue }
+    }
+
     @State private var userInput = ""
     @State private var response = "Ask me anything..."
+    @State private var selectedMode: AssistantMode = .chat
+    @StateObject private var audioCaptureManager = AudioCaptureManager()
+    @StateObject private var proactiveAgentManager = ProactiveAgentManager()
 
     var body: some View {
         VStack(spacing: 12) {
             Text("AI Assistant")
                 .font(.headline)
 
+            Picker("Mode", selection: $selectedMode) {
+                ForEach(AssistantMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
             ScrollView {
                 VStack(alignment: .leading) {
-                    Text(response)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    MarkdownResponseView(markdown: response)
                         .padding(.bottom, 4)
 
                     HStack {
@@ -40,38 +55,151 @@ struct ContentView: View {
             .background(Color.black.opacity(0.1))
             .cornerRadius(10)
 
-            TextField("Type your question", text: $userInput)
-                .textFieldStyle(RoundedBorderTextFieldStyle())
-                .submitLabel(.send)
-                .onSubmit {
-                    askAI()
+            HStack(spacing: 8) {
+                TextField("Type your question", text: $userInput)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .submitLabel(.send)
+                    .onSubmit {
+                        askAI()
+                    }
+
+                Button(action: {
+                    toggleAudioRecording()
+                }) {
+                    Image(systemName: audioCaptureManager.isRecording ? "stop.circle.fill" : "mic.circle.fill")
+                        .font(.system(size: 24))
+                        .foregroundStyle(audioCaptureManager.isRecording ? .red : .accentColor)
                 }
+                .buttonStyle(.plain)
+                .help(audioCaptureManager.isRecording ? "Stop recording and send transcript to Gemini" : "Record laptop audio and microphone")
+                .disabled(audioCaptureManager.isProcessing)
+            }
 
             Button("Ask with Screenshot") {
                 askAIWithScreenshot()
             }
             .keyboardShortcut("s", modifiers: [.command])
+            .disabled(audioCaptureManager.isRecording || audioCaptureManager.isProcessing)
 
             Button("Ask") {
                 askAI()
             }
             .keyboardShortcut(.return, modifiers: [])
+            .disabled(audioCaptureManager.isRecording || audioCaptureManager.isProcessing || proactiveAgentManager.isBusy)
+
+            if selectedMode == .agent && proactiveAgentManager.hasPendingApproval {
+                HStack(spacing: 8) {
+                    Button(proactiveAgentManager.approvalButtonTitle) {
+                        Task {
+                            await proactiveAgentManager.approveCurrentAction()
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button("Reject") {
+                        proactiveAgentManager.rejectCurrentAction()
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
         }
         .padding()
         .background(.ultraThinMaterial)
         .cornerRadius(16)
         .frame(width: 300)
         .shadow(radius: 8)
+        .onReceive(proactiveAgentManager.$renderedOutput) { output in
+            if selectedMode == .agent {
+                response = output
+            }
+        }
     }
 
     // Function to handle text-only questions
     func askAI() {
         guard !userInput.isEmpty else { return }
-        response = "Thinking..."
-        sendToGemini(prompt: userInput) { result in
-            response = result
-            userInput = ""
+        let request = userInput
+        userInput = ""
+
+        switch selectedMode {
+        case .chat:
+            response = "Thinking..."
+            sendToGemini(prompt: request) { result in
+                response = result
+            }
+        case .agent:
+            Task {
+                await proactiveAgentManager.submit(request: request)
+            }
         }
+    }
+
+    func toggleAudioRecording() {
+        Task {
+            if audioCaptureManager.isRecording {
+                await stopAudioRecordingAndSend()
+            } else {
+                await startAudioRecording()
+            }
+        }
+    }
+
+    func startAudioRecording() async {
+        response = "Starting audio capture..."
+
+        do {
+            try await audioCaptureManager.startRecording()
+            response = "Recording laptop audio and microphone. Press the mic button again to stop and send the transcript to Gemini."
+        } catch {
+            response = "❌ \(error.localizedDescription)"
+        }
+    }
+
+    func stopAudioRecordingAndSend() async {
+        response = "Transcribing audio..."
+
+        do {
+            let transcript = try await audioCaptureManager.stopRecording()
+            let prompt = buildAudioPrompt(with: transcript)
+
+            await MainActor.run {
+                response = "Thinking with audio transcript..."
+            }
+
+            sendToGemini(prompt: prompt) { result in
+                response = """
+                Transcript:
+
+                \(transcript)
+
+                Gemini:
+
+                \(result)
+                """
+                userInput = ""
+            }
+        } catch {
+            response = "❌ \(error.localizedDescription)"
+        }
+    }
+
+    func buildAudioPrompt(with transcript: String) -> String {
+        let trimmedInput = userInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedInput.isEmpty {
+            return """
+            You are receiving a transcript captured from the laptop audio and microphone. Please respond to it directly.
+
+            Transcript:
+            \(transcript)
+            """
+        }
+
+        return """
+        \(trimmedInput)
+
+        Transcript captured from the laptop audio and microphone:
+        \(transcript)
+        """
     }
 
     // Function to handle questions with a screenshot
@@ -107,6 +235,228 @@ struct ContentView: View {
                     userInput = ""
                 }
             }
+        }
+    }
+}
+
+struct MarkdownResponseView: View {
+    let markdown: String
+
+    private var blocks: [MarkdownBlock] {
+        MarkdownBlockParser.parse(markdown)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(blocks) { block in
+                switch block.kind {
+                case .markdown(let text):
+                    MarkdownTextBlockView(markdown: text)
+                case .code(let language, let code):
+                    CodeBlockView(language: language, code: code)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct MarkdownTextBlockView: View {
+    let markdown: String
+
+    private var parsedMarkdown: AttributedString? {
+        try? AttributedString(
+            markdown: markdown,
+            options: AttributedString.MarkdownParsingOptions(
+                interpretedSyntax: .full,
+                failurePolicy: .returnPartiallyParsedIfPossible
+            )
+        )
+    }
+
+    var body: some View {
+        Group {
+            if let parsedMarkdown {
+                Text(parsedMarkdown)
+            } else {
+                Text(markdown)
+            }
+        }
+        .font(.system(size: 14, weight: .regular, design: .rounded))
+        .foregroundStyle(.primary)
+        .lineSpacing(6)
+        .textSelection(.enabled)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.white.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+    }
+}
+
+struct CodeBlockView: View {
+    let language: String?
+    let code: String
+
+    private var executableCommand: String? {
+        TerminalCommandRunner.command(from: code, language: language)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text((language?.isEmpty == false ? language! : "code").uppercased())
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                if let executableCommand {
+                    Button(action: {
+                        TerminalCommandRunner.run(command: executableCommand)
+                    }) {
+                        Label("Run", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+
+                Button(action: {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(code, forType: .string)
+                }) {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            Text(code)
+                .font(.system(size: 13, weight: .regular, design: .monospaced))
+                .foregroundStyle(Color.white.opacity(0.95))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.black.opacity(0.72))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.white.opacity(0.1), lineWidth: 1)
+        )
+    }
+}
+
+struct MarkdownBlock: Identifiable {
+    enum Kind {
+        case markdown(String)
+        case code(language: String?, code: String)
+    }
+
+    let id = UUID()
+    let kind: Kind
+}
+
+enum MarkdownBlockParser {
+    static func parse(_ markdown: String) -> [MarkdownBlock] {
+        let pattern = #"(?s)```([^\n`]*)\n(.*?)\n?```"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return [MarkdownBlock(kind: .markdown(markdown))]
+        }
+
+        let nsRange = NSRange(markdown.startIndex..., in: markdown)
+        let matches = regex.matches(in: markdown, options: [], range: nsRange)
+        guard !matches.isEmpty else {
+            return [MarkdownBlock(kind: .markdown(markdown))]
+        }
+
+        var blocks: [MarkdownBlock] = []
+        var currentIndex = markdown.startIndex
+
+        for match in matches {
+            guard let matchRange = Range(match.range, in: markdown) else { continue }
+
+            let leadingText = String(markdown[currentIndex..<matchRange.lowerBound])
+            appendMarkdownBlock(leadingText, to: &blocks)
+
+            let language = Range(match.range(at: 1), in: markdown).map {
+                markdown[$0].trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            let code = Range(match.range(at: 2), in: markdown).map {
+                markdown[$0].trimmingCharacters(in: .newlines)
+            } ?? ""
+
+            blocks.append(MarkdownBlock(kind: .code(language: language, code: code)))
+            currentIndex = matchRange.upperBound
+        }
+
+        let trailingText = String(markdown[currentIndex...])
+        appendMarkdownBlock(trailingText, to: &blocks)
+
+        return blocks.isEmpty ? [MarkdownBlock(kind: .markdown(markdown))] : blocks
+    }
+
+    private static func appendMarkdownBlock(_ text: String, to blocks: inout [MarkdownBlock]) {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        blocks.append(MarkdownBlock(kind: .markdown(text)))
+    }
+}
+
+enum TerminalCommandRunner {
+    private static let shellLanguages = Set(["bash", "sh", "shell", "zsh", "console", "terminal"])
+
+    static func command(from code: String, language: String?) -> String? {
+        let normalizedLanguage = language?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let lines = code
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+
+        let isPromptBlock = lines.contains { $0.trimmingCharacters(in: .whitespaces).hasPrefix("$ ") }
+        guard shellLanguages.contains(normalizedLanguage ?? "") || isPromptBlock else {
+            return nil
+        }
+
+        let cleaned = lines.map { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("$ ") {
+                return String(trimmed.dropFirst(2))
+            }
+            return line
+        }
+        .joined(separator: "\n")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return cleaned.isEmpty ? nil : cleaned
+    }
+
+    static func run(command: String) {
+        let escapedCommand = command
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+
+        let appleScript = """
+        tell application "Terminal"
+            activate
+            do script "\(escapedCommand)"
+        end tell
+        """
+
+        guard let script = NSAppleScript(source: appleScript) else {
+            NSSound.beep()
+            return
+        }
+
+        var errorInfo: NSDictionary?
+        script.executeAndReturnError(&errorInfo)
+        if errorInfo != nil {
+            NSSound.beep()
         }
     }
 }
